@@ -12,6 +12,12 @@ import {
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
 } from "../src/watcher-state.js";
+import {
+  extractPng,
+  parseAdbDevices,
+  parseDisplaySize,
+  selectAdbDevice,
+} from "../src/adb-device.js";
 
 test("the bundled result uses only exact device-verified scope", () => {
   assert.equal(isExactSnapshot(INITIAL_VERIFIED_SNAPSHOT), true);
@@ -99,4 +105,55 @@ test("recognizes the terms button despite OCR reading uppercase I as a bar", () 
     isTermsAgreementButtonVisible("PLEASE READ AND AGREE TO THE TERMS AND CONDITIONS FOR THIS SERVICE"),
     false,
   );
+});
+
+test("selects Waydroid without confusing it with a connected phone", () => {
+  const devices = parseAdbDevices(`List of devices attached
+R5CT123456 device product:dreamlte model:Phone transport_id:1
+192.168.240.112:5555 device product:lineage_waydroid_x86_64 model:WayDroid_x86_64 transport_id:2
+`);
+
+  assert.equal(selectAdbDevice(devices, { mode: "waydroid" }).serial, "192.168.240.112:5555");
+});
+
+test("keeps the ordinary ADB backend and supports an explicit serial", () => {
+  const devices = parseAdbDevices(`List of devices attached
+R5CT123456 device product:dreamlte model:Phone transport_id:1
+emulator-5554 device product:sdk model:Emulator transport_id:2
+`);
+
+  assert.throws(() => selectAdbDevice(devices, { mode: "adb" }), /found 2/);
+  assert.equal(
+    selectAdbDevice(devices, { mode: "adb", serial: "R5CT123456" }).serial,
+    "R5CT123456",
+  );
+});
+
+test("requires authorization for a Waydroid ADB connection", () => {
+  const devices = parseAdbDevices(`List of devices attached
+192.168.240.112:5555 unauthorized transport_id:2
+`);
+
+  assert.throws(
+    () => selectAdbDevice(devices, { mode: "waydroid" }),
+    /waiting for ADB authorization/,
+  );
+});
+
+test("uses the active Android display override for Waydroid calibration", () => {
+  assert.deepEqual(parseDisplaySize("Physical size: 1920x1080\nOverride size: 1220x2712\n"), {
+    width: 1220,
+    height: 2712,
+  });
+});
+
+test("strips Waydroid graphics warnings from a screenshot stream", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  const noisy = Buffer.concat([
+    Buffer.from("/vendor/etc/hwdata/amdgpu.ids: No such file or directory\n"),
+    png,
+  ]);
+
+  assert.deepEqual(extractPng(noisy), png);
+  assert.throws(() => extractPng(Buffer.from("not an image")), /did not contain a PNG/);
 });
