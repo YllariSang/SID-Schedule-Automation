@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#062f39" />
+    <title>MARINA OAS Watch</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" type="module"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="MARINA OAS Watch home">
+        <span class="brand-mark" aria-hidden="true">M</span>
+        <span>
+          <strong>MARINA OAS Watch</strong>
+          <small>Appointment availability monitor</small>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <button id="alerts-button" class="button button-muted" type="button">Enable alerts</button>
+        <button id="check-button" class="button button-primary" type="button">
+          <span class="refresh-icon" aria-hidden="true">↻</span> Reload results
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="eyebrow"><span class="live-dot"></span> Exact eGov calendar verification</div>
+        <h1>Check SID openings.<br /><em>No feed guesses.</em></h1>
+        <p>
+          Device-assisted checks use the same authenticated MARINA calendar displayed
+          inside eGovPH and stop at December 31, 2026.
+        </p>
+        <div class="scope-chips" aria-label="Configured appointment scope">
+          <span><small>Category</small> Overseas</span>
+          <span><small>Seafarer type</small> Others</span>
+          <span><small>Service</small> SID</span>
+          <span><small>Service type</small> New</span>
+          <span><small>Through</small> December 2026</span>
+        </div>
+      </section>
+
+      <section class="monitor" aria-labelledby="monitor-title">
+        <div class="section-heading">
+          <div>
+            <p class="kicker">Verified status</p>
+            <h2 id="monitor-title">Office availability</h2>
+          </div>
+          <div id="updated-at" class="updated-at">Waiting for first check…</div>
+        </div>
+
+        <div id="error-banner" class="error-banner" role="alert" hidden></div>
+        <div id="schedule-grid" class="schedule-grid" aria-live="polite">
+          <article class="schedule-card skeleton"></article>
+          <article class="schedule-card skeleton"></article>
+          <article class="schedule-card skeleton"></article>
+        </div>
+      </section>
+
+      <section class="how-it-works">
+        <div>
+          <p class="kicker">How it works</p>
+          <h2>Quietly checks.<br />Clearly alerts.</h2>
+        </div>
+        <ol>
+          <li><span>01</span><p><strong>Uses the exact filters</strong>Overseas, Others, SID, and New are selected inside the authenticated eGovPH MARINA flow.</p></li>
+          <li><span>02</span><p><strong>Reads calendar colors</strong>An ADB capture can record green/open cells without clicking a date or reserving anything.</p></li>
+          <li><span>03</span><p><strong>You book securely</strong>Use your verified eGovPH account to review and book the actual appointment.</p></li>
+        </ol>
+      </section>
+
+      <section class="notice">
+        <span aria-hidden="true">i</span>
+        <p><strong>This tool never books or holds a slot.</strong> A fresh exact scan requires the phone’s active 60-minute eGovPH MARINA session. The inaccurate public earliest-date feed is not used.</p>
+      </section>
+    </main>
+
+    <footer>
+      <p>Independent availability helper · Not affiliated with MARINA, DICT, or eGovPH</p>
+      <a href="https://sidsrb.marina.gov.ph/" target="_blank" rel="noreferrer">Open official MARINA OAS ↗</a>
+    </footer>
+  </body>
+</html>
