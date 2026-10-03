@@ -2,6 +2,15 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import {
+  EGOV_PACKAGE,
+  connectWaydroidAdb,
+  extractPng,
+  parseAdbDevices,
+  parseDisplaySize,
+  runText,
+  selectAdbDevice,
+} from "./adb-device.js";
 import { detectOpenDates } from "./calendar.js";
 import { OFFICES, SCOPE } from "./config.js";
 import {
@@ -39,6 +48,10 @@ const intervalSeconds = boundedNumber(
   3600,
 );
 const runOnce = process.argv.includes("--once");
+const deviceMode = process.argv.includes("--waydroid")
+  ? "waydroid"
+  : argumentValue("--device") ?? process.env.WATCH_DEVICE?.trim().toLowerCase() ?? "adb";
+const requestedSerial = argumentValue("--serial") ?? process.env.ADB_SERIAL?.trim();
 const tessdata = path.resolve("vendor/tessdata");
 const statusFile = path.resolve("data/watcher-status.json");
 const alertDir = path.resolve("data/alerts");
@@ -49,7 +62,7 @@ let scaleX = 1;
 let scaleY = 1;
 
 await initializeDevice();
-log(`USB device ${deviceSerial} ready (${Math.round(BASE_WIDTH * scaleX)}x${Math.round(BASE_HEIGHT * scaleY)}).`);
+log(`ADB device ${deviceSerial} ready (${Math.round(BASE_WIDTH * scaleX)}x${Math.round(BASE_HEIGHT * scaleY)}).`);
 log(`Watching ${OFFICES.map((office) => office.name).join(", ")} through December 2026.`);
 log(`Interval: ${intervalSeconds}s. The watcher never taps a calendar date.`);
 
@@ -89,7 +102,9 @@ async function runCycle() {
     schemaVersion: 1,
     checkedAt: new Date().toISOString(),
     durationSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
-    source: "eGovPH MARINA OAS calendar via USB ADB",
+    source: deviceMode === "waydroid"
+      ? "eGovPH MARINA OAS calendar via Waydroid ADB"
+      : "eGovPH MARINA OAS calendar via ADB",
     scope: SCOPE,
     results,
   };
@@ -455,27 +470,65 @@ function formatOfficeResult(result) {
 }
 
 async function initializeDevice() {
-  const lines = adbText(["devices"]).split("\n").filter((line) => /\tdevice$/.test(line));
-  if (lines.length !== 1) throw new Error(`Expected one authorized USB-ADB device; found ${lines.length}.`);
-  deviceSerial = lines[0].split("\t")[0];
-  const size = adbText(["shell", "wm", "size"]).match(/Physical size:\s*(\d+)x(\d+)/i);
+  if (!new Set(["adb", "waydroid"]).has(deviceMode)) {
+    throw new Error(`Unsupported device mode “${deviceMode}”; use adb or waydroid.`);
+  }
+  if (deviceMode === "waydroid") connectWaydroidAdb();
+
+  let devices;
+  try {
+    devices = parseAdbDevices(runText("adb", ["devices", "-l"]));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new Error("ADB is not installed. Install the host `adb` package before running the watcher.");
+    }
+    throw error;
+  }
+  deviceSerial = selectAdbDevice(devices, { mode: deviceMode, serial: requestedSerial }).serial;
+
+  if (deviceMode === "waydroid") {
+    const packageCheck = spawnSync(
+      "adb",
+      ["-s", deviceSerial, "shell", "pm", "path", EGOV_PACKAGE],
+      { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 },
+    );
+    if (packageCheck.error) throw packageCheck.error;
+    const packagePath = packageCheck.stdout.trim();
+    if (!packagePath.startsWith("package:")) {
+      throw new Error("eGovPH is not installed in Waydroid. Install it from Play Store, then run `npm run waydroid:setup`.");
+    }
+    adbText(["shell", "input", "keyevent", "KEYCODE_WAKEUP"]);
+    adbText(["shell", "wm", "dismiss-keyguard"]);
+    const windows = adbText(["shell", "dumpsys", "window", "windows"]);
+    const focusedWindows = windows
+      .split(/\r?\n/)
+      .filter((line) => /mCurrentFocus|mFocusedApp|mTopFullscreenOpaqueWindow/.test(line))
+      .join(" ");
+    if (!focusedWindows.includes(EGOV_PACKAGE)) {
+      adbText(["shell", "monkey", "-p", EGOV_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"]);
+      await delay(5000);
+    }
+  }
+
+  const size = parseDisplaySize(adbText(["shell", "wm", "size"]));
   if (!size) throw new Error("Could not read the phone display size.");
-  scaleX = Number(size[1]) / BASE_WIDTH;
-  scaleY = Number(size[2]) / BASE_HEIGHT;
+  scaleX = size.width / BASE_WIDTH;
+  scaleY = size.height / BASE_HEIGHT;
   if (Math.abs(scaleX - scaleY) > 0.05 || scaleX < 0.7 || scaleX > 1.5) {
-    throw new Error(`Unsupported display geometry ${size[1]}x${size[2]}; expected the calibrated 1220x2712 layout.`);
+    const setupHint = deviceMode === "waydroid" ? " Run `npm run waydroid:setup` first." : "";
+    throw new Error(`Unsupported display geometry ${size.width}x${size.height}; expected the calibrated 1220x2712 layout.${setupHint}`);
   }
   execFileSync("tesseract", ["--version"], { stdio: "ignore" });
   execFileSync("ffmpeg", ["-version"], { stdio: "ignore" });
-  adbText(["shell", "svc", "power", "stayon", "usb"]);
+  adbText(["shell", "svc", "power", "stayon", deviceMode === "waydroid" ? "true" : "usb"]);
 }
 
 async function readScreen() {
   const file = path.join(scratchDir, `screen-${String(captureNumber++).padStart(5, "0")}.png`);
-  const image = execFileSync("adb", ["-s", deviceSerial, "exec-out", "screencap", "-p"], {
+  const screenshotOutput = execFileSync("adb", ["-s", deviceSerial, "exec-out", "screencap", "-p"], {
     maxBuffer: 20 * 1024 * 1024,
   });
-  await writeFile(file, image);
+  await writeFile(file, extractPng(screenshotOutput));
   const env = { ...process.env, TESSDATA_PREFIX: tessdata };
   const text = execFileSync("tesseract", [file, "stdout", "--psm", "6"], {
     encoding: "utf8",
@@ -577,7 +630,7 @@ async function swipe(x1, y1, x2, y2, duration) {
 }
 
 function adbText(args) {
-  return execFileSync("adb", args, { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 });
+  return execFileSync("adb", ["-s", deviceSerial, ...args], { encoding: "utf8", maxBuffer: 5 * 1024 * 1024 });
 }
 
 async function saveAlertEvidence(source, officeId, month) {
