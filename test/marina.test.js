@@ -8,6 +8,10 @@ import {
 } from "../src/marina.js";
 import { INITIAL_VERIFIED_SNAPSHOT } from "../src/verified.js";
 import { calendarCellCenter, detectOpenDates } from "../src/calendar.js";
+import {
+  isOfficeSelectorVisible,
+  isTermsAgreementButtonVisible,
+} from "../src/watcher-state.js";
 
 test("the bundled result uses only exact device-verified scope", () => {
   assert.equal(isExactSnapshot(INITIAL_VERIFIED_SNAPSHOT), true);
@@ -73,4 +77,26 @@ test("does not mistake a red closed calendar cell for an opening", () => {
   pixels[offset + 2] = 147;
 
   assert.deepEqual(detectOpenDates(pixels, width, height, "2026-12"), []);
+});
+
+test("accepts a valid office selector when Central Office is scrolled off-screen", () => {
+  assert.equal(
+    isOfficeSelectorVisible("DMW PROCESSING CENTER MARINA-NCR PITX LA UNION BATANGAS"),
+    true,
+  );
+  assert.equal(
+    isOfficeSelectorVisible("SELECT MARINA SITE YOU WISH TO VISIT DMW PROCESSING CENTER"),
+    false,
+  );
+});
+
+test("recognizes the terms button despite OCR reading uppercase I as a bar", () => {
+  assert.equal(
+    isTermsAgreementButtonVisible("| AGREE TO THE TERMS & CONDITIONS OF THIS WEBSITE"),
+    true,
+  );
+  assert.equal(
+    isTermsAgreementButtonVisible("PLEASE READ AND AGREE TO THE TERMS AND CONDITIONS FOR THIS SERVICE"),
+    false,
+  );
 });

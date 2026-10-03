@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { detectOpenDates } from "./calendar.js";
 import { OFFICES, SCOPE } from "./config.js";
+import {
+  isOfficeSelectorVisible,
+  isTermsAgreementButtonVisible,
+} from "./watcher-state.js";
 
 const BASE_WIDTH = 1220;
 const BASE_HEIGHT = 2712;
@@ -26,7 +30,7 @@ const MONTHS = [
 const OFFICE_CHOICES = {
   "central-office": /^CENTRAL$/i,
   "dmw-processing-center": /^DMW$/i,
-  "marina-ncr": /MARINA.?NCR/i,
+  "marina-ncr": /^(?:MARINA.?NCR|NCR)$/i,
 };
 const intervalSeconds = boundedNumber(
   argumentValue("--interval") ?? process.env.WATCH_INTERVAL_SECONDS,
@@ -161,14 +165,24 @@ async function ensureTransactionForm() {
 
 async function waitForManualTermsAcceptance() {
   let termsReady = false;
-  for (let attempt = 0; attempt < 16; attempt += 1) {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
     const screen = await readScreen();
-    if (screenContent(screen).includes("I AGREE TO THE TERMS")) {
+    const content = screenContent(screen);
+    const state = classify(screen.text);
+
+    if (state === "form") {
+      log("Terms were accepted on the phone; continuing from the transaction form.");
+      return;
+    }
+    if (isTermsAgreementButtonVisible(content)) {
       termsReady = true;
       break;
     }
+    if (state !== "terms" && state !== "unknown") {
+      throw new Error(`The Terms screen changed unexpectedly while scrolling (${state}).`);
+    }
     await swipe(600, 2200, 600, 650, 300);
-    await delay(250);
+    await delay(500);
   }
   if (!termsReady) throw new Error("Could not expose the MARINA terms agreement button safely.");
 
@@ -284,15 +298,28 @@ async function configureOffice(office) {
 async function chooseOffice(office) {
   await tap(600, 1080);
   await delay(1100);
-  const screen = await readScreen();
-  const content = screenContent(screen);
-  if (!content.includes("CENTRAL OFFICE") || !content.includes("DMW PROCESSING CENTER") || !content.includes("MARINA-NCR")) {
-    throw new Error("The office selector could not be normalized to its verified top options.");
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const screen = await readScreen();
+    const content = screenContent(screen);
+    if (!isOfficeSelectorVisible(content)) {
+      throw new Error("The office selector did not open in a verified state.");
+    }
+
+    const choice = findWord(screen.tsv, OFFICE_CHOICES[office.id]);
+    if (choice) {
+      await tapBox(choice);
+      await delay(1500);
+      return;
+    }
+
+    if (office.id === "central-office") {
+      await swipe(600, 900, 600, 2050, 450);
+    } else {
+      await swipe(600, 2050, 600, 900, 450);
+    }
+    await delay(700);
   }
-  const choice = findWord(screen.tsv, OFFICE_CHOICES[office.id]);
-  if (!choice) throw new Error(`Could not locate ${office.name} by label in the office selector.`);
-  await tapBox(choice);
-  await delay(1500);
+  throw new Error(`Could not locate ${office.name} by label in the verified office selector.`);
 }
 
 async function chooseFromDialog({
@@ -469,7 +496,7 @@ function classify(text) {
   const value = normalize(text);
   if (value.includes("GO BACK TO EGOVPH HOME")) return "home-confirm";
   if (value.includes("GENDER EQUALITY DISCLAIMER")) return "disclaimer";
-  if (value.includes("BEFORE YOU BEGIN") || value.includes("I AGREE TO THE TERMS")) return "terms";
+  if (value.includes("BEFORE YOU BEGIN") || isTermsAgreementButtonVisible(value)) return "terms";
   if (value.includes("SET YOUR APPOINTMENT SCHEDULE") && value.includes("PREFERRED DATE")) return "calendar";
   if (
     value.includes("SELECT YOUR TRANSACTION TYPE") ||
