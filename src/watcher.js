@@ -61,6 +61,11 @@ let deviceSerial;
 let scaleX = 1;
 let scaleY = 1;
 
+if (deviceMode === "waydroid") {
+  console.warn(
+    "[deprecated] Waydroid support is retained only as an archived experiment. Do not use sensitive eGovPH accounts; prefer a physical ADB device.",
+  );
+}
 await initializeDevice();
 log(`ADB device ${deviceSerial} ready (${Math.round(BASE_WIDTH * scaleX)}x${Math.round(BASE_HEIGHT * scaleY)}).`);
 log(`Watching ${OFFICES.map((office) => office.name).join(", ")} through December 2026.`);

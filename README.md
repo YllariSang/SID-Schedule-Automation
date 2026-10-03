@@ -1,4 +1,4 @@
-# MARINA OAS USB Watcher
+# MARINA OAS Device Watcher
 
 A read-only terminal watcher for this exact eGovPH MARINA OAS scope:
 
@@ -27,7 +27,7 @@ Requirements:
 
 - Node.js 20 or newer
 - `adb`, `ffmpeg`, and `tesseract` commands
-- One authorized USB-ADB phone at the calibrated 1220×2712 display layout
+- One authorized USB or network ADB phone at the calibrated 1220×2712 display layout
 - eGovPH opened before enabling Developer Options/USB debugging
 - Phone connected, unlocked, and eGovPH left in the foreground
 
@@ -36,6 +36,8 @@ Start continuous checks every five minutes:
 ```bash
 npm run watch
 ```
+
+`npm run watch:adb` is the explicit equivalent for a USB or network ADB device.
 
 Run one complete cycle for testing:
 
@@ -58,6 +60,53 @@ Alerts use the terminal bell and `notify-send` when available. Set `WEBHOOK_URL`
 When MARINA needs a fresh session, the watcher returns through eGovPH Home, reopens MARINA OAS, and scrolls the Terms & Conditions to the agreement button. It pauses and alerts there so you can review and tap **I Agree** yourself; it resumes automatically afterward.
 
 Manual intervention is also required if the phone locks, USB disconnects, eGovPH is killed, authentication expires, or the developer-mode warning returns.
+
+## Deprecated Waydroid experiment
+
+> **Deprecated:** Do not use this path with an eGovPH or primary Google account. Waydroid shares the host kernel, stores Android data on the host, and requires persistent ADB access. This implementation remains on its archival branch only so the experiment and reusable engineering work are not lost. Use a physical ADB phone for the actual watcher.
+
+The retained experiment lets Waydroid replace the USB phone. The host needs `adb`, Waydroid must use a Google Apps image, and eGovPH still needs a real signed-in account.
+
+1. Start the Android UI:
+
+   ```bash
+   waydroid show-full-ui
+   ```
+
+2. Historical validation required installing eGovPH from Play Store and signing in. Do not perform this step with a real account; it is retained only to document the experiment.
+
+3. Connect ADB and calibrate Waydroid to the exact phone layout used by the watcher:
+
+   ```bash
+   npm run waydroid:setup
+   ```
+
+   Accept Waydroid's ADB debugging prompt if it appears, then rerun the command. Setup sets the Android display override to 1220×2712 at 480 dpi, disables screen sleep, verifies that `egov.app` is installed, and launches it.
+
+4. With a non-sensitive test environment only, open MARINA OAS once and complete its initial screens. Then start the watcher:
+
+   ```bash
+   npm run watch:waydroid
+   ```
+
+   For a single validation cycle, use `npm run watch:waydroid:once`.
+
+Waydroid mode reconnects ADB, selects the Waydroid instance even when a USB phone is also attached, wakes and unlocks the virtual display, and launches eGovPH if it is not already visible. It does not install the app, enter credentials, accept terms, pick a date, or book an appointment. Keep the Waydroid session running while the watcher runs.
+
+If more than one ordinary ADB device is connected, select one with `--serial=<adb-serial>` or `ADB_SERIAL`. The device backend can also be chosen with `--device=adb|waydroid`; `WATCH_DEVICE=waydroid` is equivalent to the `--waydroid` flag.
+
+If `waydroid status` reports `IP address: UNKNOWN` on a host using UFW, permit only the Waydroid bridge traffic and restart the session:
+
+```bash
+sudo ufw allow in on waydroid0 to any port 67 proto udp comment 'Waydroid DHCP'
+sudo ufw allow in on waydroid0 to any port 53 proto udp comment 'Waydroid DNS'
+sudo ufw allow in on waydroid0 to any port 53 proto tcp comment 'Waydroid DNS'
+sudo ufw route allow in on waydroid0 comment 'Waydroid forwarding'
+waydroid session stop
+waydroid show-full-ui
+```
+
+These rules are scoped to the local `waydroid0` interface; the forwarding rule allows traffic originating from the Android container to be routed outward.
 
 ## Optional dashboard
 

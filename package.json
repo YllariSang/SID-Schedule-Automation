@@ -8,6 +8,11 @@
     "start": "node src/server.js",
     "watch": "node src/watcher.js",
     "watch:once": "node src/watcher.js --once",
+    "watch:adb": "node src/watcher.js --device=adb",
+    "watch:adb:once": "node src/watcher.js --device=adb --once",
+    "watch:waydroid": "node src/watcher.js --waydroid",
+    "watch:waydroid:once": "node src/watcher.js --waydroid --once",
+    "waydroid:setup": "node src/waydroid-setup.js",
     "check": "node src/cli.js",
     "capture": "node src/device-capture.js",
     "test": "node --test"
