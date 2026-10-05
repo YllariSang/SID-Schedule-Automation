@@ -7,6 +7,7 @@ import { OFFICES, SCOPE } from "./config.js";
 import {
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
+  shouldStopScanning,
 } from "./watcher-state.js";
 
 const BASE_WIDTH = 1220;
@@ -56,6 +57,7 @@ log(`Interval: ${intervalSeconds}s. The watcher never taps a calendar date.`);
 do {
   try {
     const result = await runCycle();
+    if (result.stopReason === "opening-detected") break;
     await publishResult(result);
     if (runOnce) break;
     const waitSeconds = Math.max(10, intervalSeconds - result.durationSeconds);
@@ -82,9 +84,20 @@ async function runCycle() {
     const result = await scanCalendar(office);
     results.push(result);
     log(formatOfficeResult(result));
+    if (shouldStopScanning(result)) {
+      const snapshot = cycleResult(startedAt, results, {
+        stopReason: "opening-detected",
+      });
+      await publishImmediateOpening(snapshot);
+      return snapshot;
+    }
     await returnToTransactionForm();
   }
 
+  return cycleResult(startedAt, results);
+}
+
+function cycleResult(startedAt, results, extra = {}) {
   return {
     schemaVersion: 1,
     checkedAt: new Date().toISOString(),
@@ -92,6 +105,7 @@ async function runCycle() {
     source: "eGovPH MARINA OAS calendar via USB ADB",
     scope: SCOPE,
     results,
+    ...extra,
   };
 }
 
@@ -365,6 +379,7 @@ async function scanCalendar(office) {
     months[current] = openDates;
     if (openDates.length) {
       await saveAlertEvidence(screen.path, office.id, current);
+      break;
     }
     if (current === LAST_MONTH) break;
     screen = await moveCalendar(screen, 1);
@@ -436,6 +451,18 @@ async function publishResult(result) {
     log(message);
   } else {
     log(`Open date(s) still visible: ${currentDates.join(", ")}`);
+  }
+}
+
+async function publishImmediateOpening(result) {
+  const dates = flattenOpenDates(result);
+  const message = `OPEN — ${dates.join(", ")}. Watcher stopped; the calendar remains visible.`;
+  await notify("MARINA SID opening detected", message);
+  log(message);
+  try {
+    await saveJson(statusFile, result);
+  } catch (error) {
+    console.error(`[${clock()}] Opening was alerted, but status could not be saved: ${error.message}`);
   }
 }
 
