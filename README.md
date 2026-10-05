@@ -49,7 +49,7 @@ Use a different interval, with a minimum of 60 seconds:
 npm run watch -- --interval=300
 ```
 
-The watcher keeps the phone awake while USB is connected, verifies every screen with OCR, selects the three offices sequentially, checks only through December, and never taps a calendar date. Results are written to `data/watcher-status.json`.
+The watcher keeps the phone awake while USB is connected, verifies every screen with OCR, selects the three offices sequentially, checks only through December, and never taps a calendar date. At the first detected opening it immediately alerts, saves evidence and partial status, leaves that calendar visible, and exits without scanning another month or office. Results are written to `data/watcher-status.json`.
 
 Alerts use the terminal bell and `notify-send` when available. Set `WEBHOOK_URL` to send a JSON alert to an optional webhook.
 
