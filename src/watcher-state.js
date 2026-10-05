@@ -15,3 +15,9 @@ export function isTermsAgreementButtonVisible(content) {
     content.includes("AGREE TO THE TERMS AND CONDITIONS OF THIS WEBSITE")
   );
 }
+
+export function shouldStopScanning(officeResult) {
+  return Object.values(officeResult?.months || {}).some(
+    (dates) => Array.isArray(dates) && dates.length > 0,
+  );
+}

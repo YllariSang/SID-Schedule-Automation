@@ -11,6 +11,7 @@ import { calendarCellCenter, detectOpenDates } from "../src/calendar.js";
 import {
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
+  shouldStopScanning,
 } from "../src/watcher-state.js";
 
 test("the bundled result uses only exact device-verified scope", () => {
@@ -97,6 +98,17 @@ test("recognizes the terms button despite OCR reading uppercase I as a bar", () 
   );
   assert.equal(
     isTermsAgreementButtonVisible("PLEASE READ AND AGREE TO THE TERMS AND CONDITIONS FOR THIS SERVICE"),
+    false,
+  );
+});
+
+test("stops scanning as soon as an office result contains an opening", () => {
+  assert.equal(
+    shouldStopScanning({ months: { "2026-10": [], "2026-11": ["2026-11-11"] } }),
+    true,
+  );
+  assert.equal(
+    shouldStopScanning({ months: { "2026-10": [], "2026-11": [], "2026-12": [] } }),
     false,
   );
 });
