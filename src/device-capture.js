@@ -1,6 +1,12 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  BAND_GREEN_THRESHOLD,
+  BAND_RED_THRESHOLD,
+  analyzeFrame,
+  pngSize,
+} from "./calendar.js";
 import { OFFICES } from "./config.js";
 import { buildVerifiedSnapshot, isExactSnapshot } from "./marina.js";
 import { loadSnapshot, saveSnapshot } from "./store.js";
@@ -37,8 +43,9 @@ const stamp = new Date().toISOString().replaceAll(":", "-");
 const capturePath = path.join(captureDir, `${office.id}-${month}-${stamp}.png`);
 await writeFile(capturePath, screenshot);
 
-const colors = analyzeCalendar(capturePath);
-if (colors.redPixels < 500 && colors.greenPixels < 100) {
+const colors = analyzeCalendarFrame(capturePath, screenshot);
+const isOpen = colors.green >= BAND_GREEN_THRESHOLD;
+if (colors.red < BAND_RED_THRESHOLD && colors.green < BAND_GREEN_THRESHOLD) {
   fail(`The captured screen does not look like a MARINA availability calendar. Saved: ${capturePath}`);
 }
 
@@ -48,7 +55,7 @@ const schedules = previous.schedules.map((item) => {
   if (item.id !== office.id) return item;
   const checkedMonths = [...new Set([...(item.checkedMonths || []), month])].sort();
   const openMonths = new Set(item.openMonths || []);
-  if (colors.greenPixels >= 100) openMonths.add(month);
+  if (isOpen) openMonths.add(month);
   else openMonths.delete(month);
   const open = [...openMonths].sort();
   return {
@@ -64,44 +71,27 @@ const schedules = previous.schedules.map((item) => {
 
 const next = buildVerifiedSnapshot({ checkedAt: new Date(), schedules });
 await saveSnapshot(next);
-console.log(`${office.name} ${month}: ${colors.greenPixels >= 100 ? "OPEN DATE VISIBLE" : "no open date"}`);
+console.log(`${office.name} ${month}: ${isOpen ? "OPEN DATE VISIBLE" : "no open date"}`);
 console.log(`Evidence saved: ${capturePath}`);
 console.log("Dashboard status updated.");
 
-function analyzeCalendar(file) {
+/**
+ * Green/red totals for the calendar band. The thresholds and predicates are the same ones
+ * the watcher uses, so the capture helper and the continuous watcher can no longer disagree
+ * about what counts as an opening.
+ */
+function analyzeCalendarFrame(file, png) {
+  const size = pngSize(png);
+  if (!size) fail("ADB did not return a readable PNG screenshot.");
+
   const result = spawnSync(
     "ffmpeg",
-    [
-      "-v",
-      "error",
-      "-i",
-      file,
-      "-vf",
-      "crop=iw*0.885:ih*0.24:iw*0.057:ih*0.557",
-      "-f",
-      "rawvideo",
-      "-pix_fmt",
-      "rgb24",
-      "pipe:1",
-    ],
-    { maxBuffer: 20 * 1024 * 1024 },
+    ["-v", "error", "-i", file, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+    { maxBuffer: 30 * 1024 * 1024 },
   );
   if (result.status !== 0) fail(`Unable to analyze screenshot: ${String(result.stderr)}`);
 
-  let greenPixels = 0;
-  let redPixels = 0;
-  for (let index = 0; index < result.stdout.length; index += 3) {
-    const red = result.stdout[index];
-    const green = result.stdout[index + 1];
-    const blue = result.stdout[index + 2];
-    if (green > red + 8 && green > blue + 15 && red > 120 && green > 150 && blue < 200) {
-      greenPixels += 1;
-    }
-    if (red > 220 && red > green + 45 && green > 70 && green < 190 && blue < 200) {
-      redPixels += 1;
-    }
-  }
-  return { greenPixels, redPixels };
+  return analyzeFrame(result.stdout, size.width, size.height);
 }
 
 function argumentValue(name) {

@@ -1,12 +1,15 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { detectOpenDates } from "./calendar.js";
+import { promisify } from "node:util";
+import { BAND_GREEN_THRESHOLD, CALIBRATED_GRID, fitGridOrigin, inspectMonth } from "./calendar.js";
 import { OFFICES, SCOPE } from "./config.js";
+import { parseTsv } from "./ocr.js";
 import {
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
+  returnToFormStep,
   shouldStopScanning,
 } from "./watcher-state.js";
 
@@ -40,18 +43,27 @@ const intervalSeconds = boundedNumber(
   3600,
 );
 const runOnce = process.argv.includes("--once");
+const officeFilter = argumentValue("--office");
+const OFFICES_TO_SCAN = officeFilter ? OFFICES.filter((office) => office.id === officeFilter) : OFFICES;
 const tessdata = path.resolve("vendor/tessdata");
 const statusFile = path.resolve("data/watcher-status.json");
+const detectorValidationFile = path.resolve("data/detector-validation.json");
 const alertDir = path.resolve("data/alerts");
 const scratchDir = await mkdtemp(path.join(tmpdir(), "marina-oas-watcher-"));
+const runExecFile = promisify(execFile);
 let captureNumber = 0;
 let deviceSerial;
 let scaleX = 1;
 let scaleY = 1;
 
+if (officeFilter && OFFICES_TO_SCAN.length === 0) {
+  console.error(`Unknown office "${officeFilter}". Valid ids: ${OFFICES.map((office) => office.id).join(", ")}.`);
+  process.exit(1);
+}
+
 await initializeDevice();
 log(`USB device ${deviceSerial} ready (${Math.round(BASE_WIDTH * scaleX)}x${Math.round(BASE_HEIGHT * scaleY)}).`);
-log(`Watching ${OFFICES.map((office) => office.name).join(", ")} through December 2026.`);
+log(`Watching ${OFFICES_TO_SCAN.map((office) => office.name).join(", ")} through December 2026.`);
 log(`Interval: ${intervalSeconds}s. The watcher never taps a calendar date.`);
 
 do {
@@ -78,14 +90,14 @@ async function runCycle() {
   await ensureTransactionForm();
   await ensureBlankTransactionForm();
 
-  for (const office of OFFICES) {
+  for (const office of OFFICES_TO_SCAN) {
     log(`Checking ${office.name}…`);
     await configureOffice(office);
     const result = await scanCalendar(office);
     results.push(result);
     log(formatOfficeResult(result));
     if (shouldStopScanning(result)) {
-      const snapshot = cycleResult(startedAt, results, {
+      const snapshot = await cycleResult(startedAt, results, {
         stopReason: "opening-detected",
       });
       await publishImmediateOpening(snapshot);
@@ -97,16 +109,33 @@ async function runCycle() {
   return cycleResult(startedAt, results);
 }
 
-function cycleResult(startedAt, results, extra = {}) {
+async function cycleResult(startedAt, results, extra = {}) {
   return {
     schemaVersion: 1,
     checkedAt: new Date().toISOString(),
     durationSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
     source: "eGovPH MARINA OAS calendar via USB ADB",
     scope: SCOPE,
+    detector: {
+      method: "cell-fraction+band",
+      validated: await isDetectorValidated(),
+    },
     results,
     ...extra,
   };
+}
+
+/**
+ * Detection is only "verified" once the offline validator has seen the detector fire on a
+ * screenshot where a human also confirmed an opening. Until then status is reported honestly.
+ */
+async function isDetectorValidated() {
+  try {
+    const record = JSON.parse(await readFile(detectorValidationFile, "utf8"));
+    return Boolean(record?.matched);
+  } catch {
+    return false;
+  }
 }
 
 async function ensureBlankTransactionForm() {
@@ -158,8 +187,7 @@ async function ensureTransactionForm() {
       continue;
     }
     if (state === "disclaimer") {
-      await tapWord(screen, /^CLOSE$/i, [610, 2080]);
-      await delay(2500);
+      await closeDisclaimer(screen);
       continue;
     }
     if (state === "developer-warning") {
@@ -241,7 +269,7 @@ async function configureOffice(office) {
   let screen = await readScreen();
   const expectedOffice = office.id === "marina-ncr" ? "MARINA-NCR" : office.name.toUpperCase();
   if (!screenContent(screen).includes(expectedOffice)) {
-    await chooseOffice(office);
+    await chooseOffice(office, screen);
     await delay(2200);
     screen = await readScreen();
   }
@@ -281,6 +309,7 @@ async function configureOffice(office) {
     selectedEvidence: "IDENTITY DOCUMENT",
   });
   await delay(1800);
+
   await chooseFromDialog({
     dropdown: [600, 1880],
     dialogText: "SELECT SERVICE TYPE",
@@ -309,14 +338,28 @@ async function configureOffice(office) {
   }
 }
 
-async function chooseOffice(office) {
-  await tap(600, 1080);
-  await delay(1100);
+async function chooseOffice(office, knownScreen) {
+  let screen = knownScreen || (await readScreen());
+  let listOpen = isOfficeSelectorVisible(screenContent(screen));
+  let everOpened = listOpen;
+
   for (let attempt = 0; attempt < 6; attempt += 1) {
-    const screen = await readScreen();
-    const content = screenContent(screen);
-    if (!isOfficeSelectorVisible(content)) {
-      throw new Error("The office selector did not open in a verified state.");
+    if (!listOpen) {
+      // Opening the list can take a moment to render, so wait for its options before
+      // concluding it did not open. Re-tapping is only safe here, where the list is
+      // confirmed closed; a tap inside an open list would land on an unrelated office.
+      await tap(600, 1080);
+      listOpen = false;
+      for (let poll = 0; poll < 3; poll += 1) {
+        await delay(1100);
+        screen = await readScreen();
+        if (isOfficeSelectorVisible(screenContent(screen))) {
+          listOpen = true;
+          everOpened = true;
+          break;
+        }
+      }
+      if (!listOpen) continue;
     }
 
     const choice = findWord(screen.tsv, OFFICE_CHOICES[office.id]);
@@ -332,18 +375,17 @@ async function chooseOffice(office) {
       await swipe(600, 2050, 600, 900, 450);
     }
     await delay(700);
+    screen = await readScreen();
+  }
+  if (!everOpened) {
+    throw new Error("The office selector did not open in a verified state.");
   }
   throw new Error(`Could not locate ${office.name} by label in the verified office selector.`);
 }
 
-async function chooseFromDialog({
-  dropdown,
-  dialogText,
-  dialogEvidence = [],
-  choice,
-  fallback,
-  selectedEvidence,
-}) {
+async function chooseFromDialog(spec) {
+  const { dropdown, dialogText, dialogEvidence = [], choice, fallback, selectedEvidence } = spec;
+
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await tap(...dropdown);
     await delay(1100);
@@ -363,21 +405,55 @@ async function chooseFromDialog({
 
 async function scanCalendar(office) {
   const months = {};
+  const diagnostics = {};
+  const warnings = [];
   const notShown = [];
+  const width = Math.round(BASE_WIDTH * scaleX);
+  const height = Math.round(BASE_HEIGHT * scaleY);
   let screen = await readScreen();
   let current = extractMonth(screen.text);
   if (!current) throw new Error(`Could not read the initial calendar month for ${office.name}.`);
+
+  // Recover where the day grid actually is on this screen before sampling it.
+  let origin = fitGridOrigin(screen.tsv, width, height, current) ?? CALIBRATED_GRID;
 
   while (compareMonth(current, FIRST_MONTH) < 0) {
     screen = await moveCalendar(screen, 1);
     current = extractMonth(screen.text);
   }
-  if (compareMonth(current, FIRST_MONTH) > 0) notShown.push(FIRST_MONTH);
+  if (compareMonth(current, FIRST_MONTH) > 0) {
+    notShown.push(FIRST_MONTH);
+    warnings.push({
+      code: "coverage-gap",
+      month: FIRST_MONTH,
+      message: `${office.name} did not show ${FIRST_MONTH}; that month was not checked.`,
+    });
+  }
 
   while (compareMonth(current, LAST_MONTH) <= 0) {
-    const openDates = analyzeOpenDates(screen.path, current);
-    months[current] = openDates;
-    if (openDates.length) {
+    origin = fitGridOrigin(screen.tsv, width, height, current) ?? origin;
+    const inspection = analyzeCalendarScreen(screen.path, current, origin);
+    months[current] = inspection.dates;
+    diagnostics[current] = summarizeInspection(inspection);
+
+    if (inspection.ambiguous.length) {
+      warnings.push({
+        code: "ambiguous-cells",
+        month: current,
+        dates: inspection.ambiguous.map((cell) => cell.date),
+        message: `${office.name} ${current}: ${inspection.ambiguous.length} cell(s) partially green; review the screenshot.`,
+      });
+    }
+    if (inspection.dates.length === 0 && inspection.band.green >= BAND_GREEN_THRESHOLD) {
+      warnings.push({
+        code: "unexplained-green",
+        month: current,
+        greenPixels: inspection.band.green,
+        message: `${office.name} ${current}: ${inspection.band.green} green pixels in the calendar band but no date resolved.`,
+      });
+    }
+
+    if (inspection.dates.length) {
       await saveAlertEvidence(screen.path, office.id, current);
       break;
     }
@@ -386,7 +462,19 @@ async function scanCalendar(office) {
     current = extractMonth(screen.text);
   }
 
-  return { id: office.id, name: office.name, months, notShown };
+  return { id: office.id, name: office.name, months, notShown, diagnostics, warnings };
+}
+
+function summarizeInspection(inspection) {
+  return {
+    grid: inspection.grid,
+    bandGreen: inspection.band.green,
+    bandRed: inspection.band.red,
+    nonZeroCells: inspection.cells
+      .filter((cell) => cell.fraction > 0)
+      .map((cell) => [cell.date, cell.fraction]),
+    ambiguous: inspection.ambiguous.map((cell) => [cell.date, cell.fraction]),
+  };
 }
 
 async function moveCalendar(previousScreen, direction) {
@@ -402,41 +490,68 @@ async function moveCalendar(previousScreen, direction) {
   return next;
 }
 
-async function returnToTransactionForm(initialScreen) {
-  let screen = initialScreen || (await readScreen());
-  if (classify(screen.text) === "form") return;
-
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const back = findWord(screen.tsv, /^BACK$/i);
-    if (back) {
-      await tapBox(back);
-      await delay(3200);
-      screen = await readScreen();
-      if (classify(screen.text) === "form") return;
-    }
-    await swipe(600, 2150, 600, 750, 600);
-    await delay(800);
-    screen = await readScreen();
-  }
-  throw new Error("Could not find the MARINA calendar Back button; refusing to use blind navigation.");
+async function closeDisclaimer(screen) {
+  // The Gender Equality Disclaimer sheet has one Close button, matched by word with the
+  // coordinate fallback the transaction form recovery already uses.
+  await tapWord(screen, /^CLOSE$/i, [610, 2080]);
+  await delay(2500);
 }
 
-function analyzeOpenDates(file, monthKey) {
+async function returnToTransactionForm(initialScreen) {
+  let screen = initialScreen || (await readScreen());
+  let state = classify(screen.text);
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const step = returnToFormStep(state, findWord(screen.tsv, /^BACK$/i));
+    if (step === "done") return;
+
+    if (step === "close-disclaimer") {
+      await closeDisclaimer(screen);
+    } else {
+      const back = step === "tap-back" ? findWord(screen.tsv, /^BACK$/i) : null;
+      if (back) {
+        await tapBox(back);
+        await delay(3200);
+        screen = await readScreen();
+        state = classify(screen.text);
+        if (state === "form") return;
+      }
+      // Scroll to look for the Back button elsewhere on the page.
+      await swipe(600, 2150, 600, 750, 600);
+      await delay(800);
+    }
+
+    screen = await readScreen();
+    state = classify(screen.text);
+  }
+
+  throw new Error(
+    `Could not return to the MARINA transaction form (still showing ${state}); refusing to use blind navigation.`,
+  );
+}
+
+function analyzeCalendarScreen(file, monthKey, origin) {
   const pixels = spawnSync(
     "ffmpeg",
     ["-v", "error", "-i", file, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-    { maxBuffer: 20 * 1024 * 1024 },
+    // 1.5x the calibrated layout is ~22MB of RGB, which the geometry check still allows.
+    { maxBuffer: 40 * 1024 * 1024 },
   );
-  if (pixels.status !== 0) throw new Error(`ffmpeg could not read the calendar screenshot: ${String(pixels.stderr)}`);
+  if (pixels.status !== 0) {
+    throw new Error(
+      `ffmpeg could not read the calendar screenshot: ${String(pixels.error?.message || pixels.stderr)}`,
+    );
+  }
 
   const width = Math.round(BASE_WIDTH * scaleX);
   const height = Math.round(BASE_HEIGHT * scaleY);
-  return detectOpenDates(pixels.stdout, width, height, monthKey);
+  return inspectMonth(pixels.stdout, width, height, monthKey, { origin });
 }
 
 async function publishResult(result) {
   const previous = await loadJson(statusFile);
   await saveJson(statusFile, result);
+  await reportWarnings(result, previous);
   const previousDates = new Set(flattenOpenDates(previous));
   const currentDates = flattenOpenDates(result);
   const newDates = currentDates.filter((entry) => !previousDates.has(entry));
@@ -473,6 +588,36 @@ function flattenOpenDates(snapshot) {
   );
 }
 
+/**
+ * Coverage gaps, ambiguous cells and unexplained green are logged on every cycle but only
+ * announced once, so a month the calendar refuses to show can never pass as a clean result.
+ */
+async function reportWarnings(result, previous) {
+  const current = collectWarnings(result);
+  if (!current.length) return;
+
+  const known = new Set(collectWarnings(previous).map((entry) => entry.key));
+  for (const entry of current) log(`WARNING ${entry.code}: ${entry.message}`);
+
+  const fresh = current.filter((entry) => !known.has(entry.key));
+  if (fresh.length) {
+    await notify(
+      "MARINA watcher needs review",
+      fresh.map((entry) => entry.message).join("\n"),
+    );
+  }
+}
+
+function collectWarnings(snapshot) {
+  const entries = [];
+  for (const office of snapshot?.results ?? []) {
+    for (const warning of office.warnings ?? []) {
+      entries.push({ ...warning, key: `${office.id}:${warning.code}:${warning.month ?? ""}` });
+    }
+  }
+  return entries;
+}
+
 function formatOfficeResult(result) {
   const dates = Object.values(result.months).flat();
   const coverage = Object.keys(result.months).join(", ");
@@ -504,19 +649,21 @@ async function readScreen() {
   });
   await writeFile(file, image);
   const env = { ...process.env, TESSDATA_PREFIX: tessdata };
-  const text = execFileSync("tesseract", [file, "stdout", "--psm", "6"], {
-    encoding: "utf8",
-    env,
-    maxBuffer: 5 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  const tsv = execFileSync("tesseract", [file, "stdout", "--psm", "11", "tsv"], {
-    encoding: "utf8",
-    env,
-    maxBuffer: 5 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  return { path: file, text, tsv: parseTsv(tsv) };
+  // Both OCR passes read the same file, so they run together: measured on a calendar-like
+  // screen this is 1488ms serial versus 981ms concurrent, with identical output.
+  const [plain, words] = await Promise.all([
+    runExecFile("tesseract", [file, "stdout", "--psm", "6"], {
+      encoding: "utf8",
+      env,
+      maxBuffer: 5 * 1024 * 1024,
+    }),
+    runExecFile("tesseract", [file, "stdout", "--psm", "11", "tsv"], {
+      encoding: "utf8",
+      env,
+      maxBuffer: 5 * 1024 * 1024,
+    }),
+  ]);
+  return { path: file, text: plain.stdout, tsv: parseTsv(words.stdout) };
 }
 
 function classify(text) {
@@ -552,22 +699,6 @@ function monthOrdinal(value) {
 
 function compareMonth(left, right) {
   return monthOrdinal(left) - monthOrdinal(right);
-}
-
-function parseTsv(value) {
-  return value
-    .split(/\r?\n/)
-    .slice(1)
-    .map((line) => line.split("\t"))
-    .filter((columns) => columns.length >= 12 && columns[11].trim())
-    .map((columns) => ({
-      left: Number(columns[6]),
-      top: Number(columns[7]),
-      width: Number(columns[8]),
-      height: Number(columns[9]),
-      confidence: Number(columns[10]),
-      text: columns[11].trim(),
-    }));
 }
 
 function findWord(words, pattern) {

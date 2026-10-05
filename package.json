@@ -10,6 +10,7 @@
     "watch:once": "node src/watcher.js --once",
     "check": "node src/cli.js",
     "capture": "node src/device-capture.js",
+    "validate": "node src/validate-detector.js",
     "test": "node --test"
   },
   "engines": {

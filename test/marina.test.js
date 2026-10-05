@@ -8,11 +8,17 @@ import {
 } from "../src/marina.js";
 import { INITIAL_VERIFIED_SNAPSHOT } from "../src/verified.js";
 import { calendarCellCenter, detectOpenDates } from "../src/calendar.js";
+import { fillCell } from "./fixtures.js";
 import {
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
+  returnToFormStep,
   shouldStopScanning,
 } from "../src/watcher-state.js";
+
+function word(text, left, top, confidence = 80) {
+  return { text, left, top, width: 60, height: 40, confidence };
+}
 
 test("the bundled result uses only exact device-verified scope", () => {
   assert.equal(isExactSnapshot(INITIAL_VERIFIED_SNAPSHOT), true);
@@ -58,11 +64,7 @@ test("detects a green calendar cell as its exact date", () => {
   const width = 1220;
   const height = 2712;
   const pixels = Buffer.alloc(width * height * 3, 255);
-  const { x, y } = calendarCellCenter("2026-11", 11, width, height);
-  const offset = (y * width + x) * 3;
-  pixels[offset] = 190;
-  pixels[offset + 1] = 220;
-  pixels[offset + 2] = 145;
+  fillCell(pixels, "2026-11", 11);
 
   assert.deepEqual(detectOpenDates(pixels, width, height, "2026-11"), ["2026-11-11"]);
 });
@@ -91,6 +93,18 @@ test("accepts a valid office selector when Central Office is scrolled off-screen
   );
 });
 
+test("does not mistake the closed office field for an open list", () => {
+  assert.equal(
+    isOfficeSelectorVisible("SELECT MARINA OFFICE SELECT MARINA SITE YOU WISH TO VISIT"),
+    false,
+  );
+  assert.equal(isOfficeSelectorVisible("SELECT MARINA OFFICE CENTRAL OFFICE"), false);
+  assert.equal(
+    isOfficeSelectorVisible("SELECT MARINA OFFICE CENTRAL OFFICE DMW PROCESSING CENTER"),
+    true,
+  );
+});
+
 test("recognizes the terms button despite OCR reading uppercase I as a bar", () => {
   assert.equal(
     isTermsAgreementButtonVisible("| AGREE TO THE TERMS & CONDITIONS OF THIS WEBSITE"),
@@ -111,4 +125,17 @@ test("stops scanning as soon as an office result contains an opening", () => {
     shouldStopScanning({ months: { "2026-10": [], "2026-11": [], "2026-12": [] } }),
     false,
   );
+});
+
+test("closes the disclaimer sheet Back can open instead of scrolling for a Back button", () => {
+  const back = word("Back", 570, 2034);
+
+  assert.equal(returnToFormStep("disclaimer", null), "close-disclaimer");
+  assert.equal(returnToFormStep("disclaimer", back), "close-disclaimer");
+  assert.equal(returnToFormStep("form", null), "done");
+  assert.equal(returnToFormStep("calendar", back), "tap-back");
+  assert.equal(returnToFormStep("calendar", null), "scroll");
+  // Screens the return path has no dedicated handler for keep the previous behaviour.
+  assert.equal(returnToFormStep("unknown", back), "tap-back");
+  assert.equal(returnToFormStep("unknown", null), "scroll");
 });
