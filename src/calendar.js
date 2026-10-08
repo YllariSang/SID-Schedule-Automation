@@ -21,6 +21,14 @@ export const BAND_GREEN_THRESHOLD = 100;
 /** Red pixels inside the calendar band; used to confirm the screen is a calendar at all. */
 export const BAND_RED_THRESHOLD = 500;
 
+/** A calendar is safe to inspect only after at least one availability fill has rendered. */
+export function isCalendarBandRendered(band) {
+  return Boolean(
+    band &&
+      (band.red >= BAND_RED_THRESHOLD || band.green >= BAND_GREEN_THRESHOLD),
+  );
+}
+
 export function calendarCellCenter(monthKey, day, width = BASE_WIDTH, height = BASE_HEIGHT, origin = CALIBRATED_GRID) {
   const [year, month] = monthKey.split("-").map(Number);
   const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();

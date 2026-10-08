@@ -2,13 +2,15 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  BAND_GREEN_THRESHOLD,
-  BAND_RED_THRESHOLD,
-  analyzeFrame,
+  CALIBRATED_GRID,
+  fitGridOrigin,
+  inspectMonth,
+  isCalendarBandRendered,
   pngSize,
 } from "./calendar.js";
 import { OFFICES } from "./config.js";
 import { buildVerifiedSnapshot, isExactSnapshot } from "./marina.js";
+import { parseTsv } from "./ocr.js";
 import { loadSnapshot, saveSnapshot } from "./store.js";
 import { INITIAL_VERIFIED_SNAPSHOT } from "./verified.js";
 
@@ -43,9 +45,9 @@ const stamp = new Date().toISOString().replaceAll(":", "-");
 const capturePath = path.join(captureDir, `${office.id}-${month}-${stamp}.png`);
 await writeFile(capturePath, screenshot);
 
-const colors = analyzeCalendarFrame(capturePath, screenshot);
-const isOpen = colors.green >= BAND_GREEN_THRESHOLD;
-if (colors.red < BAND_RED_THRESHOLD && colors.green < BAND_GREEN_THRESHOLD) {
+const inspection = analyzeCalendarFrame(capturePath, screenshot, month);
+const isOpen = inspection.dates.length > 0;
+if (!isCalendarBandRendered(inspection.band)) {
   fail(`The captured screen does not look like a MARINA availability calendar. Saved: ${capturePath}`);
 }
 
@@ -71,16 +73,17 @@ const schedules = previous.schedules.map((item) => {
 
 const next = buildVerifiedSnapshot({ checkedAt: new Date(), schedules });
 await saveSnapshot(next);
-console.log(`${office.name} ${month}: ${isOpen ? "OPEN DATE VISIBLE" : "no open date"}`);
+console.log(
+  `${office.name} ${month}: ${isOpen ? `OPEN — ${inspection.dates.join(", ")}` : "no open date"}`,
+);
 console.log(`Evidence saved: ${capturePath}`);
 console.log("Dashboard status updated.");
 
 /**
- * Green/red totals for the calendar band. The thresholds and predicates are the same ones
- * the watcher uses, so the capture helper and the continuous watcher can no longer disagree
- * about what counts as an opening.
+ * Use the same cell-level detector as the continuous watcher so a manual capture and a live
+ * scan cannot disagree about which exact dates are open.
  */
-function analyzeCalendarFrame(file, png) {
+function analyzeCalendarFrame(file, png, monthKey) {
   const size = pngSize(png);
   if (!size) fail("ADB did not return a readable PNG screenshot.");
 
@@ -91,7 +94,14 @@ function analyzeCalendarFrame(file, png) {
   );
   if (result.status !== 0) fail(`Unable to analyze screenshot: ${String(result.stderr)}`);
 
-  return analyzeFrame(result.stdout, size.width, size.height);
+  const tsv = execFileSync("tesseract", [file, "stdout", "--psm", "11", "tsv"], {
+    encoding: "utf8",
+    env: { ...process.env, TESSDATA_PREFIX: path.resolve("vendor/tessdata") },
+    maxBuffer: 5 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const origin = fitGridOrigin(parseTsv(tsv), size.width, size.height, monthKey) ?? CALIBRATED_GRID;
+  return inspectMonth(result.stdout, size.width, size.height, monthKey, { origin });
 }
 
 function argumentValue(name) {

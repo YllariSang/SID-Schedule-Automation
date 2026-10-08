@@ -9,6 +9,7 @@ import {
   detectOpenDates,
   fitGridOrigin,
   inspectMonth,
+  isCalendarBandRendered,
   pngSize,
 } from "../src/calendar.js";
 import {
@@ -124,6 +125,13 @@ test("counts green and red across the calendar band", () => {
   assert.equal(analyzeFrame(greenFrame, WIDTH, HEIGHT).red, 0);
   assert.ok(analyzeFrame(redFrame, WIDTH, HEIGHT).red >= BAND_GREEN_THRESHOLD);
   assert.equal(analyzeFrame(redFrame, WIDTH, HEIGHT).green, 0);
+});
+
+test("requires rendered availability fills before trusting a calendar", () => {
+  assert.equal(isCalendarBandRendered({ red: 500, green: 0 }), true);
+  assert.equal(isCalendarBandRendered({ red: 0, green: 100 }), true);
+  assert.equal(isCalendarBandRendered({ red: 499, green: 99 }), false);
+  assert.equal(isCalendarBandRendered(null), false);
 });
 
 test("reads PNG dimensions from the IHDR header", () => {
