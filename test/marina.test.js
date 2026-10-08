@@ -10,6 +10,8 @@ import { INITIAL_VERIFIED_SNAPSHOT } from "../src/verified.js";
 import { calendarCellCenter, detectOpenDates } from "../src/calendar.js";
 import { fillCell } from "./fixtures.js";
 import {
+  canReuseSelectedOfficeForm,
+  findTermsAgreementTapBox,
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
   returnToFormStep,
@@ -105,6 +107,17 @@ test("does not mistake the closed office field for an open list", () => {
   );
 });
 
+test("reuses only the expected selected office in a single-office run", () => {
+  const dmwForm = "SELECT MARINA SITE YOU WISH TO VISIT DMW PROCESSING CENTER SELECT SEAFARER CATEGORY";
+  assert.equal(canReuseSelectedOfficeForm(dmwForm, "dmw-processing-center", 1), true);
+  assert.equal(canReuseSelectedOfficeForm(dmwForm, "marina-ncr", 1), false);
+  assert.equal(canReuseSelectedOfficeForm(dmwForm, "dmw-processing-center", 3), false);
+  assert.equal(
+    canReuseSelectedOfficeForm("DMW PROCESSING CENTER CENTRAL OFFICE", "dmw-processing-center", 1),
+    false,
+  );
+});
+
 test("recognizes the terms button despite OCR reading uppercase I as a bar", () => {
   assert.equal(
     isTermsAgreementButtonVisible("| AGREE TO THE TERMS & CONDITIONS OF THIS WEBSITE"),
@@ -116,6 +129,20 @@ test("recognizes the terms button despite OCR reading uppercase I as a bar", () 
   );
 });
 
+test("auto-agree locates only a complete, confident agreement label", () => {
+  const label = ["I", "AGREE", "TO", "THE", "TERMS", "&", "CONDITIONS", "OF", "THIS", "WEBSITE"];
+  const boxes = label.map((text, index) => word(text, 80 + index * 65, 2300));
+  assert.equal(findTermsAgreementTapBox(boxes, 2712), boxes[1]);
+  assert.equal(findTermsAgreementTapBox(boxes.slice(0, -1), 2712), null);
+  assert.equal(findTermsAgreementTapBox(boxes.map((box) => ({ ...box, top: 400 })), 2712), null);
+  assert.equal(findTermsAgreementTapBox(boxes.map((box, index) =>
+    index === 5 ? { ...box, confidence: 10 } : box), 2712), null);
+  assert.equal(findTermsAgreementTapBox(boxes.map((box, index) =>
+    index === 9 ? { ...box, top: 2100 } : box), 2712), null);
+  const alternate = boxes.map((box) => box.text === "&" ? { ...box, text: "AND" } : box);
+  assert.equal(findTermsAgreementTapBox(alternate, 2712), alternate[1]);
+});
+
 test("stops scanning as soon as an office result contains an opening", () => {
   assert.equal(
     shouldStopScanning({ months: { "2026-10": [], "2026-11": ["2026-11-11"] } }),
@@ -124,6 +151,10 @@ test("stops scanning as soon as an office result contains an opening", () => {
   assert.equal(
     shouldStopScanning({ months: { "2026-10": [], "2026-11": [], "2026-12": [] } }),
     false,
+  );
+  assert.equal(
+    shouldStopScanning({ months: { "2026-11": [] }, requiresReview: true }),
+    true,
   );
 });
 

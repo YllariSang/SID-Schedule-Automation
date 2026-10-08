@@ -13,6 +13,17 @@ export function isOfficeSelectorVisible(content) {
   return WATCHED_OFFICE_LABELS.filter((label) => content.includes(label)).length >= 2;
 }
 
+/** Reuse a selected site only when it is the single office this watcher is checking. */
+export function canReuseSelectedOfficeForm(content, officeId, watchedOfficeCount) {
+  if (watchedOfficeCount !== 1 || isOfficeSelectorVisible(content)) return false;
+  const expected = {
+    "central-office": "CENTRAL OFFICE",
+    "dmw-processing-center": "DMW PROCESSING CENTER",
+    "marina-ncr": "MARINA-NCR",
+  }[officeId];
+  return Boolean(expected && content.includes(expected));
+}
+
 export function isTermsAgreementButtonVisible(content) {
   return (
     content.includes("AGREE TO THE TERMS & CONDITIONS OF THIS WEBSITE") ||
@@ -20,9 +31,37 @@ export function isTermsAgreementButtonVisible(content) {
   );
 }
 
+/** Locate the exact agreement label, not an incidental "agree" in the page text. */
+export function findTermsAgreementTapBox(words, screenHeight) {
+  const tokens = words.flatMap((box) =>
+    String(box.text).toUpperCase().match(/[A-Z]+|&/g)?.map((text) => ({ text, box })) ?? [],
+  );
+  const phrases = [
+    ["AGREE", "TO", "THE", "TERMS", "&", "CONDITIONS", "OF", "THIS", "WEBSITE"],
+    ["AGREE", "TO", "THE", "TERMS", "AND", "CONDITIONS", "OF", "THIS", "WEBSITE"],
+  ];
+  for (let start = 0; start < tokens.length; start += 1) {
+    for (const phrase of phrases) {
+      const candidate = tokens.slice(start, start + phrase.length);
+      if (candidate.length !== phrase.length ||
+          !candidate.every((token, index) => token.text === phrase[index])) continue;
+      const boxes = candidate.map(({ box }) => box);
+      const tops = boxes.map((box) => box.top);
+      if (boxes.some((box) => box.confidence <= 20 || box.width <= 0 || box.height <= 0) ||
+          Math.min(...tops) < screenHeight * 0.4 ||
+          Math.max(...tops) - Math.min(...tops) > 160) continue;
+      return boxes[0];
+    }
+  }
+  return null;
+}
+
 export function shouldStopScanning(officeResult) {
-  return Object.values(officeResult?.months || {}).some(
-    (dates) => Array.isArray(dates) && dates.length > 0,
+  return (
+    Boolean(officeResult?.requiresReview) ||
+    Object.values(officeResult?.months || {}).some(
+      (dates) => Array.isArray(dates) && dates.length > 0,
+    )
   );
 }
 

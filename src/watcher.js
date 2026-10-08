@@ -1,12 +1,21 @@
 import { execFile, execFileSync, spawnSync } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { rmSync, unlinkSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BAND_GREEN_THRESHOLD, CALIBRATED_GRID, fitGridOrigin, inspectMonth } from "./calendar.js";
+import {
+  BAND_GREEN_THRESHOLD,
+  CALIBRATED_GRID,
+  fitGridOrigin,
+  inspectMonth,
+  isCalendarBandRendered,
+} from "./calendar.js";
 import { OFFICES, SCOPE } from "./config.js";
 import { parseTsv } from "./ocr.js";
 import {
+  canReuseSelectedOfficeForm,
+  findTermsAgreementTapBox,
   isOfficeSelectorVisible,
   isTermsAgreementButtonVisible,
   returnToFormStep,
@@ -38,11 +47,13 @@ const OFFICE_CHOICES = {
 };
 const intervalSeconds = boundedNumber(
   argumentValue("--interval") ?? process.env.WATCH_INTERVAL_SECONDS,
-  300,
-  60,
+  180,
+  35,
   3600,
 );
 const runOnce = process.argv.includes("--once");
+const noWait = process.argv.includes("--no-wait");
+const autoAgree = process.argv.includes("--auto-agree");
 const officeFilter = argumentValue("--office");
 const OFFICES_TO_SCAN = officeFilter ? OFFICES.filter((office) => office.id === officeFilter) : OFFICES;
 const tessdata = path.resolve("vendor/tessdata");
@@ -55,6 +66,12 @@ let captureNumber = 0;
 let deviceSerial;
 let scaleX = 1;
 let scaleY = 1;
+let deviceLockFile;
+let ownsDeviceLock = false;
+
+process.on("exit", cleanupRuntimeFiles);
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
 
 if (officeFilter && OFFICES_TO_SCAN.length === 0) {
   console.error(`Unknown office "${officeFilter}". Valid ids: ${OFFICES.map((office) => office.id).join(", ")}.`);
@@ -62,17 +79,23 @@ if (officeFilter && OFFICES_TO_SCAN.length === 0) {
 }
 
 await initializeDevice();
+await acquireDeviceLock();
 log(`USB device ${deviceSerial} ready (${Math.round(BASE_WIDTH * scaleX)}x${Math.round(BASE_HEIGHT * scaleY)}).`);
 log(`Watching ${OFFICES_TO_SCAN.map((office) => office.name).join(", ")} through December 2026.`);
-log(`Interval: ${intervalSeconds}s. The watcher never taps a calendar date.`);
+log(`${noWait ? "No wait between completed scans" : `Interval: ${intervalSeconds}s`}. The watcher never taps a calendar date.`);
+if (autoAgree) log("Auto-agree enabled for the MARINA Terms & Conditions screen.");
 
 do {
   try {
     const result = await runCycle();
-    if (result.stopReason === "opening-detected") break;
+    if (result.stopReason) break;
     await publishResult(result);
     if (runOnce) break;
-    const waitSeconds = Math.max(10, intervalSeconds - result.durationSeconds);
+    if (noWait) {
+      log("Starting the next scan immediately.");
+      continue;
+    }
+    const waitSeconds = Math.max(5, intervalSeconds - result.durationSeconds);
     log(`Next scan in ${waitSeconds}s (target start interval: ${intervalSeconds}s).`);
     await delay(waitSeconds * 1000);
   } catch (error) {
@@ -87,20 +110,22 @@ do {
 async function runCycle() {
   const startedAt = new Date();
   const results = [];
-  await ensureTransactionForm();
-  await ensureBlankTransactionForm();
+  const formScreen = await ensureTransactionForm();
+  await ensureBlankTransactionForm(formScreen);
 
   for (const office of OFFICES_TO_SCAN) {
     log(`Checking ${office.name}…`);
-    await configureOffice(office);
-    const result = await scanCalendar(office);
+    const calendarScreen = await configureOffice(office);
+    const result = await scanCalendar(office, calendarScreen);
     results.push(result);
     log(formatOfficeResult(result));
     if (shouldStopScanning(result)) {
+      const reviewRequired = result.requiresReview && !Object.values(result.months).flat().length;
       const snapshot = await cycleResult(startedAt, results, {
-        stopReason: "opening-detected",
+        stopReason: reviewRequired ? "opening-review-required" : "opening-detected",
       });
-      await publishImmediateOpening(snapshot);
+      if (reviewRequired) await publishImmediateReview(snapshot, result);
+      else await publishImmediateOpening(snapshot);
       return snapshot;
     }
     await returnToTransactionForm();
@@ -138,11 +163,14 @@ async function isDetectorValidated() {
   }
 }
 
-async function ensureBlankTransactionForm() {
-  await scrollToFormTop();
-  let screen = await readScreen();
+async function ensureBlankTransactionForm(knownScreen) {
+  let screen = knownScreen ?? await scrollToFormTop();
   const content = screenContent(screen);
   if (content.includes("SELECT MARINA OFFICE")) return;
+  if (canReuseSelectedOfficeForm(content, OFFICES_TO_SCAN[0]?.id, OFFICES_TO_SCAN.length)) {
+    log(`Reusing the ${OFFICES_TO_SCAN[0].name} form after Back.`);
+    return;
+  }
   if (content.includes("CENTRAL OFFICE")) {
     log("Resuming a verified partial Central Office form from a prior fail-closed attempt.");
     return;
@@ -165,15 +193,14 @@ async function ensureTransactionForm() {
     const state = classify(screen.text);
 
     if (state === "form") {
-      await scrollToFormTop();
-      return;
+      return scrollToFormTop();
     }
     if (state === "calendar") {
       await returnToTransactionForm(screen);
       continue;
     }
     if (state === "terms") {
-      await waitForManualTermsAcceptance();
+      await waitForTermsAcceptance();
       continue;
     }
     if (state === "home-confirm") {
@@ -205,8 +232,8 @@ async function ensureTransactionForm() {
   throw new Error("Could not recover the MARINA transaction form after multiple verified attempts.");
 }
 
-async function waitForManualTermsAcceptance() {
-  let termsReady = false;
+async function waitForTermsAcceptance() {
+  let readyScreen = null;
   for (let attempt = 0; attempt < 24; attempt += 1) {
     const screen = await readScreen();
     const content = screenContent(screen);
@@ -217,7 +244,7 @@ async function waitForManualTermsAcceptance() {
       return;
     }
     if (isTermsAgreementButtonVisible(content)) {
-      termsReady = true;
+      readyScreen = screen;
       break;
     }
     if (state !== "terms" && state !== "unknown") {
@@ -226,7 +253,28 @@ async function waitForManualTermsAcceptance() {
     await swipe(600, 2200, 600, 650, 300);
     await delay(500);
   }
-  if (!termsReady) throw new Error("Could not expose the MARINA terms agreement button safely.");
+  if (!readyScreen) throw new Error("Could not expose the MARINA terms agreement button safely.");
+
+  if (autoAgree) {
+    const box = findTermsAgreementTapBox(readyScreen.tsv, Math.round(BASE_HEIGHT * scaleY));
+    if (box) {
+      log("Tapping the verified MARINA Terms agreement control.");
+      await tapBox(box);
+      try {
+        await waitForScreen(
+          (screen) => classify(screen.text) === "form",
+          "transaction form after Terms agreement",
+          { timeoutMs: 15_000 },
+        );
+        log("Terms accepted; continuing from the transaction form.");
+        return;
+      } catch (error) {
+        log(`${error.message} Falling back to manual agreement.`);
+      }
+    } else {
+      log("Could not safely locate the Terms agreement control; falling back to manual agreement.");
+    }
+  }
 
   await notify(
     "MARINA action required",
@@ -257,21 +305,17 @@ async function scrollToFormTop() {
   for (let count = 0; count < 4; count += 1) {
     const screen = await readScreen();
     const content = screenContent(screen);
-    if (content.includes("SELECT MARINA OFFICE") || content.includes("SELECT MARINA SITE")) return;
+    if (content.includes("SELECT MARINA OFFICE") || content.includes("SELECT MARINA SITE")) return screen;
     await swipe(600, 750, 600, 2200, 450);
-    await delay(650);
   }
   throw new Error("Could not normalize the transaction form to its top position without overscrolling.");
 }
 
 async function configureOffice(office) {
-  await scrollToFormTop();
-  let screen = await readScreen();
+  let screen = await scrollToFormTop();
   const expectedOffice = office.id === "marina-ncr" ? "MARINA-NCR" : office.name.toUpperCase();
   if (!screenContent(screen).includes(expectedOffice)) {
-    await chooseOffice(office, screen);
-    await delay(2200);
-    screen = await readScreen();
+    screen = await chooseOffice(office, screen);
   }
   if (!screenContent(screen).includes(expectedOffice)) {
     throw new Error(`Office verification failed: expected ${office.name}.`);
@@ -293,7 +337,6 @@ async function configureOffice(office) {
   });
 
   await swipe(600, 2100, 600, 900, 700);
-  await delay(1000);
   screen = await readScreen();
   const categoryText = screenContent(screen);
   if (!categoryText.includes("OVERSEAS")) {
@@ -308,9 +351,8 @@ async function configureOffice(office) {
     fallback: [500, 1430],
     selectedEvidence: "IDENTITY DOCUMENT",
   });
-  await delay(1800);
 
-  await chooseFromDialog({
+  screen = await chooseFromDialog({
     dropdown: [600, 1880],
     dialogText: "SELECT SERVICE TYPE",
     dialogEvidence: ["RENEWAL", "REISSUANCE"],
@@ -318,12 +360,11 @@ async function configureOffice(office) {
     fallback: [500, 1160],
     selectedEvidence: "NEW",
   });
-  await delay(1800);
 
-  screen = await readScreen();
   const selected = screenContent(screen);
   if (
     !selected.includes("OVERSEAS") ||
+    !selected.includes("OTHERS") ||
     !(selected.includes("IDENTITY DOCUMENT") || selected.includes("SID")) ||
     !selected.includes("NEW")
   ) {
@@ -331,11 +372,7 @@ async function configureOffice(office) {
   }
 
   await tap(600, 2040);
-  await delay(5000);
-  screen = await readScreen();
-  if (classify(screen.text) !== "calendar") {
-    throw new Error(`Calendar did not open for ${office.name}.`);
-  }
+  return waitForRenderedCalendar({ description: `calendar for ${office.name}` });
 }
 
 async function chooseOffice(office, knownScreen) {
@@ -349,15 +386,16 @@ async function chooseOffice(office, knownScreen) {
       // concluding it did not open. Re-tapping is only safe here, where the list is
       // confirmed closed; a tap inside an open list would land on an unrelated office.
       await tap(600, 1080);
-      listOpen = false;
-      for (let poll = 0; poll < 3; poll += 1) {
-        await delay(1100);
-        screen = await readScreen();
-        if (isOfficeSelectorVisible(screenContent(screen))) {
-          listOpen = true;
-          everOpened = true;
-          break;
-        }
+      try {
+        screen = await waitForScreen(
+          (candidate) => isOfficeSelectorVisible(screenContent(candidate)),
+          "the office selector options",
+          { timeoutMs: 5_000 },
+        );
+        listOpen = true;
+        everOpened = true;
+      } catch {
+        listOpen = false;
       }
       if (!listOpen) continue;
     }
@@ -365,8 +403,14 @@ async function chooseOffice(office, knownScreen) {
     const choice = findWord(screen.tsv, OFFICE_CHOICES[office.id]);
     if (choice) {
       await tapBox(choice);
-      await delay(1500);
-      return;
+      const expectedOffice = office.id === "marina-ncr" ? "MARINA-NCR" : office.name.toUpperCase();
+      return waitForScreen(
+        (candidate) => {
+          const content = screenContent(candidate);
+          return content.includes(expectedOffice) && !isOfficeSelectorVisible(content);
+        },
+        `${office.name} selection`,
+      );
     }
 
     if (office.id === "central-office") {
@@ -374,7 +418,6 @@ async function chooseOffice(office, knownScreen) {
     } else {
       await swipe(600, 2050, 600, 900, 450);
     }
-    await delay(700);
     screen = await readScreen();
   }
   if (!everOpened) {
@@ -388,38 +431,97 @@ async function chooseFromDialog(spec) {
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await tap(...dropdown);
-    await delay(1100);
-    const screen = await readScreen();
+    const screen = await waitForScreen(
+      (candidate) => {
+        const content = screenContent(candidate);
+        return content.includes(dialogText) || dialogEvidence.every((value) => content.includes(value));
+      },
+      `selector “${dialogText}”`,
+    );
     const content = screenContent(screen);
     if (!content.includes(dialogText) && !dialogEvidence.every((value) => content.includes(value))) {
       throw new Error(`Expected selector “${dialogText}” did not open.`);
     }
     await tapWord(screen, choice, fallback);
-    await delay(1800);
-    if (!selectedEvidence) return;
-    const selected = await readScreen();
-    if (screenContent(selected).includes(selectedEvidence)) return;
+    if (!selectedEvidence) {
+      return waitForScreen(
+        (selected) => {
+          const selectedContent = screenContent(selected);
+          const dialogStillVisible =
+            selectedContent.includes(dialogText) ||
+            dialogEvidence.every((value) => selectedContent.includes(value));
+          return classify(selected.text) === "form" && !dialogStillVisible;
+        },
+        `selector “${dialogText}” to close`,
+      );
+    }
+    try {
+      return await waitForScreen(
+        (selected) =>
+          classify(selected.text) === "form" && screenContent(selected).includes(selectedEvidence),
+        `${selectedEvidence} selection`,
+      );
+    } catch {
+      // The selector is safe to retry only after the first selection failed to persist.
+    }
   }
   throw new Error(`The selector “${dialogText}” did not retain ${selectedEvidence}.`);
 }
 
-async function scanCalendar(office) {
+async function waitForScreen(predicate, description, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const pollMs = options.pollMs ?? 150;
+  const deadline = Date.now() + timeoutMs;
+  let lastState = "unknown";
+
+  while (Date.now() < deadline) {
+    const screen = await readScreen();
+    lastState = classify(screen.text);
+    if (predicate(screen)) return screen;
+    if (Date.now() < deadline) await delay(pollMs);
+  }
+
+  throw new Error(`Timed out waiting for ${description}; last screen state was ${lastState}.`);
+}
+
+async function waitForRenderedCalendar({ expectedMonth, fallbackOrigin = CALIBRATED_GRID, description }) {
+  const width = Math.round(BASE_WIDTH * scaleX);
+  const height = Math.round(BASE_HEIGHT * scaleY);
+
+  return waitForScreen(
+    (screen) => {
+      if (classify(screen.text) !== "calendar") return false;
+      const month = extractMonth(screen.text);
+      if (!month || (expectedMonth && month !== expectedMonth)) return false;
+      const origin = fitGridOrigin(screen.tsv, width, height, month) ?? fallbackOrigin;
+      const inspection = analyzeCalendarScreen(screen.path, month, origin);
+      if (!isCalendarBandRendered(inspection.band)) return false;
+      screen.calendar = { month, origin, inspection };
+      return true;
+    },
+    description,
+    { timeoutMs: 15_000, pollMs: 200 },
+  );
+}
+
+async function scanCalendar(office, initialScreen) {
   const months = {};
   const diagnostics = {};
   const warnings = [];
   const notShown = [];
   const width = Math.round(BASE_WIDTH * scaleX);
   const height = Math.round(BASE_HEIGHT * scaleY);
-  let screen = await readScreen();
-  let current = extractMonth(screen.text);
+  let screen = initialScreen;
+  let current = screen.calendar?.month ?? extractMonth(screen.text);
   if (!current) throw new Error(`Could not read the initial calendar month for ${office.name}.`);
 
   // Recover where the day grid actually is on this screen before sampling it.
-  let origin = fitGridOrigin(screen.tsv, width, height, current) ?? CALIBRATED_GRID;
+  let origin = screen.calendar?.origin ?? fitGridOrigin(screen.tsv, width, height, current) ?? CALIBRATED_GRID;
 
   while (compareMonth(current, FIRST_MONTH) < 0) {
-    screen = await moveCalendar(screen, 1);
-    current = extractMonth(screen.text);
+    screen = await moveCalendar(screen, 1, origin);
+    current = screen.calendar.month;
+    origin = screen.calendar.origin;
   }
   if (compareMonth(current, FIRST_MONTH) > 0) {
     notShown.push(FIRST_MONTH);
@@ -431,8 +533,14 @@ async function scanCalendar(office) {
   }
 
   while (compareMonth(current, LAST_MONTH) <= 0) {
-    origin = fitGridOrigin(screen.tsv, width, height, current) ?? origin;
-    const inspection = analyzeCalendarScreen(screen.path, current, origin);
+    origin = screen.calendar?.origin ?? fitGridOrigin(screen.tsv, width, height, current) ?? origin;
+    const inspection =
+      screen.calendar?.month === current
+        ? screen.calendar.inspection
+        : analyzeCalendarScreen(screen.path, current, origin);
+    if (!isCalendarBandRendered(inspection.band)) {
+      throw new Error(`${office.name} ${current} was captured before its calendar cells rendered.`);
+    }
     months[current] = inspection.dates;
     diagnostics[current] = summarizeInspection(inspection);
 
@@ -444,7 +552,9 @@ async function scanCalendar(office) {
         message: `${office.name} ${current}: ${inspection.ambiguous.length} cell(s) partially green; review the screenshot.`,
       });
     }
-    if (inspection.dates.length === 0 && inspection.band.green >= BAND_GREEN_THRESHOLD) {
+    const unexplainedGreen =
+      inspection.dates.length === 0 && inspection.band.green >= BAND_GREEN_THRESHOLD;
+    if (unexplainedGreen) {
       warnings.push({
         code: "unexplained-green",
         month: current,
@@ -453,16 +563,32 @@ async function scanCalendar(office) {
       });
     }
 
-    if (inspection.dates.length) {
+    if (inspection.dates.length || inspection.ambiguous.length || unexplainedGreen) {
       await saveAlertEvidence(screen.path, office.id, current);
+      if (!inspection.dates.length) {
+        warnings.push({
+          code: "immediate-review",
+          month: current,
+          message: `${office.name} ${current}: suspicious green was preserved for immediate review.`,
+        });
+      }
       break;
     }
     if (current === LAST_MONTH) break;
-    screen = await moveCalendar(screen, 1);
-    current = extractMonth(screen.text);
+    screen = await moveCalendar(screen, 1, origin);
+    current = screen.calendar.month;
+    origin = screen.calendar.origin;
   }
 
-  return { id: office.id, name: office.name, months, notShown, diagnostics, warnings };
+  return {
+    id: office.id,
+    name: office.name,
+    months,
+    notShown,
+    diagnostics,
+    warnings,
+    requiresReview: warnings.some((warning) => warning.code === "immediate-review"),
+  };
 }
 
 function summarizeInspection(inspection) {
@@ -477,24 +603,25 @@ function summarizeInspection(inspection) {
   };
 }
 
-async function moveCalendar(previousScreen, direction) {
+async function moveCalendar(previousScreen, direction, fallbackOrigin) {
   const before = extractMonth(previousScreen.text);
+  const expected = monthKey(monthOrdinal(before) + direction);
   await tap(direction > 0 ? 1100 : 120, 1435);
-  await delay(3200);
-  const next = await readScreen();
-  if (classify(next.text) !== "calendar") throw new Error("Calendar navigation left the expected page.");
-  const after = extractMonth(next.text);
-  if (!after || monthOrdinal(after) !== monthOrdinal(before) + direction) {
-    throw new Error(`Calendar month did not advance as expected (${before} → ${after || "unreadable"}).`);
-  }
-  return next;
+  return waitForRenderedCalendar({
+    expectedMonth: expected,
+    fallbackOrigin,
+    description: `calendar month ${expected}`,
+  });
 }
 
 async function closeDisclaimer(screen) {
   // The Gender Equality Disclaimer sheet has one Close button, matched by word with the
   // coordinate fallback the transaction form recovery already uses.
   await tapWord(screen, /^CLOSE$/i, [610, 2080]);
-  await delay(2500);
+  return waitForScreen(
+    (candidate) => classify(candidate.text) !== "disclaimer",
+    "the disclaimer to close",
+  );
 }
 
 async function returnToTransactionForm(initialScreen) {
@@ -506,19 +633,24 @@ async function returnToTransactionForm(initialScreen) {
     if (step === "done") return;
 
     if (step === "close-disclaimer") {
-      await closeDisclaimer(screen);
+      screen = await closeDisclaimer(screen);
+      state = classify(screen.text);
+      if (state === "form") return;
+      continue;
     } else {
       const back = step === "tap-back" ? findWord(screen.tsv, /^BACK$/i) : null;
       if (back) {
         await tapBox(back);
-        await delay(3200);
-        screen = await readScreen();
+        screen = await waitForScreen(
+          (candidate) => ["form", "disclaimer"].includes(classify(candidate.text)),
+          "the transaction form after Back",
+        );
         state = classify(screen.text);
         if (state === "form") return;
+        if (state === "disclaimer") continue;
       }
       // Scroll to look for the Back button elsewhere on the page.
       await swipe(600, 2150, 600, 750, 600);
-      await delay(800);
     }
 
     screen = await readScreen();
@@ -578,6 +710,18 @@ async function publishImmediateOpening(result) {
     await saveJson(statusFile, result);
   } catch (error) {
     console.error(`[${clock()}] Opening was alerted, but status could not be saved: ${error.message}`);
+  }
+}
+
+async function publishImmediateReview(result, officeResult) {
+  const warning = officeResult.warnings.find((entry) => entry.code === "immediate-review");
+  const message = `${warning?.message || `${officeResult.name}: suspicious calendar color detected.`} Watcher stopped; the calendar remains visible.`;
+  await notify("MARINA SID opening needs review", message);
+  log(message);
+  try {
+    await saveJson(statusFile, result);
+  } catch (error) {
+    console.error(`[${clock()}] Review was alerted, but status could not be saved: ${error.message}`);
   }
 }
 
@@ -642,8 +786,56 @@ async function initializeDevice() {
   adbText(["shell", "svc", "power", "stayon", "usb"]);
 }
 
+async function acquireDeviceLock() {
+  const safeSerial = deviceSerial.replace(/[^A-Za-z0-9_.-]/g, "_");
+  deviceLockFile = path.join(tmpdir(), `marina-oas-watcher-${safeSerial}.lock`);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(deviceLockFile, "wx");
+      await handle.writeFile(`${process.pid}\n`);
+      await handle.close();
+      ownsDeviceLock = true;
+      return;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const owner = Number((await readFile(deviceLockFile, "utf8").catch(() => "")).trim());
+      if (owner && processIsAlive(owner)) {
+        throw new Error(`Another MARINA watcher (PID ${owner}) already owns device ${deviceSerial}.`);
+      }
+      await unlink(deviceLockFile).catch(() => {});
+    }
+  }
+
+  throw new Error(`Could not acquire the watcher lock for device ${deviceSerial}.`);
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function cleanupRuntimeFiles() {
+  try {
+    rmSync(scratchDir, { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup must never hide the watcher's actual exit reason.
+  }
+  if (!deviceLockFile || !ownsDeviceLock) return;
+  try {
+    unlinkSync(deviceLockFile);
+  } catch {
+    // The lock may already have been removed after a failed startup.
+  }
+}
+
 async function readScreen() {
-  const file = path.join(scratchDir, `screen-${String(captureNumber++).padStart(5, "0")}.png`);
+  captureNumber += 1;
+  const file = path.join(scratchDir, "screen.png");
   const image = execFileSync("adb", ["-s", deviceSerial, "exec-out", "screencap", "-p"], {
     maxBuffer: 20 * 1024 * 1024,
   });
@@ -695,6 +887,12 @@ function extractMonth(text) {
 function monthOrdinal(value) {
   const [year, month] = value.split("-").map(Number);
   return year * 12 + month;
+}
+
+function monthKey(ordinal) {
+  const year = Math.floor((ordinal - 1) / 12);
+  const month = ((ordinal - 1) % 12) + 1;
+  return `${year}-${String(month).padStart(2, "0")}`;
 }
 
 function compareMonth(left, right) {
