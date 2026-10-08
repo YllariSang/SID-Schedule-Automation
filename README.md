@@ -13,7 +13,7 @@ The old public earliest-date feed is intentionally not used. A phone check showe
 
 ## Current verified result
 
-Checked in the authenticated eGovPH calendar on October 3, 2026:
+Checked in the authenticated eGovPH calendar on October 8, 2026:
 
 - Central Office: no green/open dates from October through December
 - DMW Processing Center: its calendar began in November; no green/open dates in November or December
@@ -31,7 +31,7 @@ Requirements:
 - eGovPH opened before enabling Developer Options/USB debugging
 - Phone connected, unlocked, and eGovPH left in the foreground
 
-Start continuous checks every five minutes:
+Start continuous checks every three minutes:
 
 ```bash
 npm run watch
@@ -43,18 +43,32 @@ Run one complete cycle for testing:
 npm run watch:once
 ```
 
-Use a different interval, with a minimum of 60 seconds:
+Use a different interval, with a minimum of 35 seconds:
 
 ```bash
-npm run watch -- --interval=300
+npm run watch -- --interval=180
 ```
 
-A full three-office pass measured 217 seconds and the wait between passes never drops below
-10 seconds, so the fastest a pass can restart is about 227 seconds. `--interval` only
-controls that idle wait: values below ~230 change nothing today, and anything outside
-60–3600 falls back to 300 rather than being clamped.
+The watcher waits for verified screen transitions instead of sleeping a fixed number of seconds
+after each tap. The wait between passes never drops below 5 seconds; `--interval` is a target
+start-to-start interval, so a value shorter than the pass itself runs the next pass 5 seconds
+after the previous one finishes. Values outside 35–3600 fall back to 180.
 
-Watch one office instead of three — a pass drops to about a minute:
+To start the next pass immediately after each completed pass, use `--no-wait`:
+
+```bash
+npm run watch -- --office=dmw-processing-center --no-wait
+```
+
+The time to finish a pass still determines the effective check frequency. A scan that takes
+about 28–30 seconds begins its next scan as soon as it finishes; errors still use the
+30-second recovery delay.
+
+For a single-office run, Back leaves the selected office on the form. The watcher now reuses that
+office on the next pass, then selects and verifies Overseas / Others / SID / New again. It opens a
+fresh MARINA OAS form only when the expected office is missing or cannot be verified.
+
+Watch one office instead of three for the shortest possible detection loop:
 
 ```bash
 npm run watch -- --office=marina-ncr
@@ -62,7 +76,14 @@ npm run watch -- --office=marina-ncr
 
 Valid ids are `central-office`, `dmw-processing-center`, and `marina-ncr`.
 
-The watcher keeps the phone awake while USB is connected, verifies every screen with OCR, selects the three offices sequentially, checks only through December, and never taps a calendar date. At the first detected opening it immediately alerts, saves evidence and partial status, leaves that calendar visible, and exits without scanning another month or office. Results are written to `data/watcher-status.json`.
+The watcher keeps the phone awake while USB is connected, verifies every screen with OCR, selects the three offices sequentially, checks only through December, and never taps a calendar date. At the first detected opening or suspicious green cell it immediately alerts, saves evidence and partial status, leaves that calendar visible, and exits without scanning another month or office. Results are written to `data/watcher-status.json`.
+
+On the calibrated phone, the adaptive transition build completed full three-office passes in
+107–111 seconds; the previous fixed-delay build took 196–239 seconds on the same device.
+
+Only one watcher may control a USB device at a time. A per-device lock rejects a second process
+before it can tap the phone. Temporary screenshots are kept in one rotating scratch file and
+removed on exit instead of accumulating throughout a long-running session.
 
 Alerts use the terminal bell and `notify-send` when available. Set `WEBHOOK_URL` to send a JSON alert to an optional webhook; the payload is `{ title, message, at }`.
 
@@ -70,16 +91,17 @@ Because the watcher never taps a date, you are the second half of the detection 
 
 ## How an opening is detected
 
-Every day cell is sampled across its whole area instead of at one pixel, so a day number printed over the fill, anti-aliasing, and small layout shifts cannot hide an opening. A cell must be at least 6% open-green to count; anything between 1.5% and 6% is reported as `ambiguous-cells` rather than silently treated as closed. The predicate accepts the application's own OPEN swatch (`rgb(206, 223, 165)`), verified against a real screenshot.
+Every day cell is sampled across its whole area instead of at one pixel, so a day number printed over the fill, anti-aliasing, and small layout shifts cannot hide an opening. A cell must be at least 6% open-green to count; anything between 1.5% and 6% stops the watcher for immediate review rather than being silently treated as closed. The predicate accepts the application's own OPEN swatch (`rgb(206, 223, 165)`), verified against a real screenshot.
 
 Two independent checks back that up:
 
-- **Band cross-check.** Green and red totals for the whole calendar band are recorded each month. If the band is green but no day cell resolves, the watcher raises `unexplained-green` instead of reporting a clean month.
+- **Rendered-calendar gate.** A month is not inspected until the calendar band contains enough red or green availability fill. A title that appears before its cells finish rendering can no longer be recorded as a clean closed month.
+- **Band cross-check.** Green and red totals for the whole calendar band are recorded each month. If the band is green but no day cell resolves, the watcher saves evidence, alerts, and stops on that calendar instead of reporting a clean month.
 - **Grid anchoring (fallback only).** The calibrated grid is the verified primary path: against a real screenshot every sampled box lands on its own cell, and the measured row step is 108 against the calibrated 106.5. As a secondary check the day numbers OCR reads off the screen are fitted to a grid, and cells are sampled from that fit whenever it is accepted. OCR currently reads too few day numbers on this calendar for a trustworthy fit, so `grid` normally reads `calibrated` — it only reads `ocr` when a fit actually succeeds.
 
 Months the calendar refuses to show become `coverage-gap`, announced once and recorded under each office's `warnings` — a month that was never displayed can no longer pass as a clean result. Per-month detail (band totals and every non-zero cell fraction) is written to `diagnostics` in `data/watcher-status.json`, and the detector in use is reported under `detector`.
 
-The capture helper and the watcher now share one predicate and one threshold, so they can no longer disagree about what counts as an opening.
+The capture helper, validator, and watcher now share the same cell-level detector, so the manual helper reports the same exact open dates as the continuous watcher.
 
 ## Validate the detector
 
@@ -95,6 +117,14 @@ That writes `data/detector-validation.json`, after which the watcher reports `de
 
 When MARINA needs a fresh session, the watcher returns through eGovPH Home, reopens MARINA OAS, and scrolls the Terms & Conditions to the agreement button. It pauses and alerts there so you can review and tap **I Agree** yourself; it resumes automatically afterward.
 
+To have the watcher accept those terms for the logged-in account, opt in with `--auto-agree`:
+
+```bash
+npm run watch -- --office=dmw-processing-center --no-wait --auto-agree
+```
+
+It taps only when it locates the exact agreement label and verifies that the transaction form opens. If it cannot verify either step, it pauses for manual review as usual. This flag applies only to the current watcher run.
+
 Manual intervention is also required if the phone locks, USB disconnects, eGovPH is killed, authentication expires, or the developer-mode warning returns.
 
 ## Optional dashboard
@@ -106,6 +136,26 @@ npm start
 ```
 
 Open <http://127.0.0.1:4173>.
+
+## Read-only phone view on your local network
+
+Install `scrcpy` as well as the watcher dependencies. Leave the watcher running in one terminal,
+then start the viewer in another:
+
+```bash
+npm run view:lan
+```
+
+The viewer prints a private URL such as `http://192.168.100.16:4180/?token=...`. Open that exact
+URL on a phone or computer on the same local network. It shows the live phone screen with no
+audio or remote controls. The video is captured by scrcpy and converted to a browser-compatible
+stream in memory; capture stops a few seconds after the last viewer disconnects. Press Ctrl+C in
+the viewer terminal to shut down its web server. The access link changes each time it starts.
+
+The viewer binds to a private LAN address only. If it selects the wrong network adapter, use
+`npm run view:lan -- --host=<computer-LAN-IP> --port=4180`. The link uses HTTP, so share it only
+on a trusted local network; anyone with the link can see everything shown on the phone, including
+personal information in eGovPH. Do not forward its port to the internet.
 
 ## Record one displayed calendar manually
 

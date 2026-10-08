@@ -8,6 +8,7 @@
     "start": "node src/server.js",
     "watch": "node src/watcher.js",
     "watch:once": "node src/watcher.js --once",
+    "view:lan": "node src/phone-view.js",
     "check": "node src/cli.js",
     "capture": "node src/device-capture.js",
     "validate": "node src/validate-detector.js",
